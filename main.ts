@@ -27,18 +27,32 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 // Carlo average, so doubling the simulations halves its Monte Carlo error
 // (practice score -34.660 -> -34.558, same hits/agreement) while the run
 // stays ~7 s, far inside the 300 s limit.
+//
+// v2: parameters are overridable from the environment for backtesting
+// (MF_*); the shipped defaults are the chosen v2 values.
+// v2 changes (see NOTES.md): DRIFT_SHRINK 0.75 -> 1.0 (the recent
+// log-rank velocity is a real signal: unshrunk drift won on the practice
+// window and both internal splits) and MIN_P 0.0015 -> 0.0045 (dropping
+// the tiniest probability rows concentrates mass where it counts).
+// Occupancy blending and sharpening were tested and REJECTED: a pure
+// occupancy table scores -55 on the practice window, blends hurt all
+// three test beds, and sharpening buys practice points only by losing
+// on split 1 (confident-wrong is punished hard by the log score).
 const SIMS = 3000;
 const HOURS = 72;
 const SEED = 12345;
-const SIGMA = 0.11; // scales the empirical per-hour log-rank steps
-const DRIFT_SHRINK = 0.75; // shrink recent log-rank velocity toward 0
+const SIGMA = Number(process.env.MF_SIGMA ?? 0.11); // scales the empirical per-hour log-rank steps
+const DRIFT_SHRINK = Number(process.env.MF_DRIFT_SHRINK ?? 1.0); // shrink recent log-rank velocity toward 0
 const DRIFT_HALF_LIFE_H = 24; // drift decays over the window
 const DRIFT_CAP = 0.05; // max |log-rank velocity| per hour
 const DRIFT_WINDOW_H = 48; // lookback for velocity estimation
 const JUMP_P = 0.02; // per hour, per game: extra jump probability
 const JUMP_SD = 0.5; // extra jump size in log-rank
-const UNNAMED = 0.15; // share of each place left for unlisted games
-const MIN_P = 0.0015; // smallest named probability
+const UNNAMED = Number(process.env.MF_UNNAMED ?? 0.15); // share of each place left for unlisted games
+const MIN_P = Number(process.env.MF_MIN_P ?? 0.0045); // smallest named probability
+const OCC_W = Number(process.env.MF_OCC_W ?? 0); // blend weight of short-window place occupancy (0 = off)
+const OCC_WINDOW_H = Number(process.env.MF_OCC_WINDOW_H ?? 48); // occupancy lookback, hours
+const SHARPEN = Number(process.env.MF_SHARPEN ?? 1); // exponent applied to blended probabilities (1 = off)
 const MAX_ROWS_PER_PLACE = 100;
 const MAX_RANK = 110; // simulation cap (chart is ~97-99 games)
 const CANDIDATE_DAYS = 7; // games unseen for longer are dropped
@@ -215,17 +229,60 @@ function main(): void {
   }
   const totalSamples = SIMS * HOURS;
 
+  // --- short-window place occupancy (v2 blend component) ---
+  // For each place, the fraction of recent reads (last OCC_WINDOW_H hours)
+  // in which each game held that place. A pure occupancy forecast scores
+  // badly over 72 h (-55 on the practice window: the chart churns), but a
+  // small blend weight sharpens the diffusion forecast toward games that
+  // have actually held each place recently.
+  const occCounts: Array<Map<number, number>> = Array.from({ length: places + 1 }, () => new Map());
+  if (OCC_W > 0) {
+    const occCutoff = lastAt - OCC_WINDOW_H * 3600000;
+    for (const s of hist) {
+      if (new Date(s.at).getTime() < occCutoff) continue;
+      for (const r of s.up_and_coming) {
+        if (r.rank < 1 || r.rank > places) continue;
+        const m = occCounts[r.rank]!;
+        m.set(r.universe_id, (m.get(r.universe_id) ?? 0) + 1);
+      }
+    }
+  }
+
   // --- assemble the forecast ---
   const probabilities: Array<{ universe_id: number; place: number; p: number }> = [];
   const perPlace: Array<Array<{ universe_id: number; p: number }>> = [];
   for (let k = 1; k <= places; k++) {
+    const occTotal = [...occCounts[k]!.values()].reduce((a, b) => a + b, 0);
     const rows: Array<{ id: number; p: number }> = [];
+    const seen = new Set<number>();
     for (const c of cand) {
-      const p = counts.get(c.id)![k]! / totalSamples;
-      if (p > MIN_P) rows.push({ id: c.id, p });
+      const pDiff = counts.get(c.id)![k]! / totalSamples;
+      const pOcc = occTotal > 0 ? (occCounts[k]!.get(c.id) ?? 0) / occTotal : 0;
+      const p = (1 - OCC_W) * pDiff + OCC_W * pOcc;
+      if (p > 0) {
+        rows.push({ id: c.id, p });
+        seen.add(c.id);
+      }
     }
-    rows.sort((a, b) => b.p - a.p);
-    const top = rows.slice(0, MAX_ROWS_PER_PLACE);
+    // games that held this place recently but are not diffusion candidates
+    // (e.g. they left the chart) can still enter via the occupancy share
+    if (OCC_W > 0) {
+      for (const [id, cnt] of occCounts[k]!) {
+        if (seen.has(id)) continue;
+        const p = OCC_W * (cnt / occTotal);
+        if (p > 0) rows.push({ id, p });
+      }
+    }
+    // sharpen: raise to a power and renormalise (1 = off)
+    let normRows = rows;
+    if (SHARPEN !== 1) {
+      const powered = rows.map((r) => ({ id: r.id, p: Math.pow(r.p, SHARPEN) }));
+      const s = powered.reduce((a, r) => a + r.p, 0);
+      normRows = s > 0 ? powered.map((r) => ({ id: r.id, p: r.p / s })) : powered;
+    }
+    const kept = normRows.filter((r) => r.p > MIN_P);
+    kept.sort((a, b) => b.p - a.p);
+    const top = kept.slice(0, MAX_ROWS_PER_PLACE);
     const sum = top.reduce((a, r) => a + r.p, 0);
     const scale = sum > 0 ? (1 - UNNAMED) / sum : 0;
     const out: Array<{ universe_id: number; p: number }> = [];
