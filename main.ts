@@ -23,7 +23,11 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 // --- tuned parameters (see NOTES.md; backtested on the practice window and
 // --- on two internal train/test splits of the chart history) ---
-const SIMS = 1500;
+// SIMS raised 1500 -> 3000 after the local grade: the forecast is a Monte
+// Carlo average, so doubling the simulations halves its Monte Carlo error
+// (practice score -34.660 -> -34.558, same hits/agreement) while the run
+// stays ~7 s, far inside the 300 s limit.
+const SIMS = 3000;
 const HOURS = 72;
 const SEED = 12345;
 const SIGMA = 0.11; // scales the empirical per-hour log-rank steps
